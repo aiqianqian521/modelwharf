@@ -1,0 +1,23 @@
+# Secrets & credentials — never commit
+.env
+*.key
+data/
+logs/
+
+# Node
+node_modules/
+package-lock.json
+*.log
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Test artifacts
+/tmp/
+diag.cjs
+diag2.cjs
+inspect.cjs
+
+# ZCode session working files (plans/tmp scripts/keys)
+.zcode/

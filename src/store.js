@@ -1,0 +1,180 @@
+'use strict';
+/**
+ * SQLite storage layer. All persistent state lives here:
+ *  - providers: platform plugins registered in the engine
+ *  - accounts:  upstream platform accounts (one row per login/credential)
+ *  - models:    model entries exposed by the gateway (per account allow/deny + alias + multiplier)
+ *  - apikeys:   keys that harness clients use to authenticate to this gateway
+ *  - usage:     per-request usage log (tokens, credits, latency, status)
+ *  - settings:  key-value app settings
+ */
+const Database = require('better-sqlite3-multiple-ciphers');
+const config = require('./config');
+
+const db = new Database(config.dbPath);
+db.pragma('journal_mode = WAL');
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT
+);
+CREATE TABLE IF NOT EXISTS providers (
+  id TEXT PRIMARY KEY,            -- e.g. 'trae', 'qoder'
+  enabled INTEGER DEFAULT 1,
+  config TEXT DEFAULT '{}',       -- provider-level config JSON (endpoints override etc.)
+  created_at INTEGER DEFAULT (unixepoch())
+);
+CREATE TABLE IF NOT EXISTS accounts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  provider_id TEXT NOT NULL,
+  name TEXT NOT NULL,             -- display name
+  credentials TEXT NOT NULL,      -- JSON: token(s)/cookies, opaque to core
+  enabled INTEGER DEFAULT 1,
+  status TEXT DEFAULT 'active',   -- active | invalid | cooling | banned
+  status_message TEXT,
+  priority INTEGER DEFAULT 100,   -- lower = preferred when routing
+  max_concurrency INTEGER DEFAULT 3,
+  last_used_at INTEGER,
+  last_check_at INTEGER,
+  extra TEXT DEFAULT '{}',        -- JSON: cached profile info (plan, credits, email...)
+  created_at INTEGER DEFAULT (unixepoch()),
+  UNIQUE(provider_id, name)
+);
+CREATE TABLE IF NOT EXISTS models (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  provider_id TEXT NOT NULL,
+  upstream_model TEXT NOT NULL,   -- model id on the upstream platform
+  public_name TEXT NOT NULL,      -- model id exposed to clients (globally unique)
+  enabled INTEGER DEFAULT 1,
+  multiplier REAL DEFAULT 1,      -- billing multiplier shown/used for accounting
+  is_free INTEGER DEFAULT 0,      -- free flag from platform or manual
+  ctx_window INTEGER,
+  max_output INTEGER,
+  tags TEXT DEFAULT '',           -- free text tags for filtering
+  note TEXT,
+  created_at INTEGER DEFAULT (unixepoch()),
+  UNIQUE(provider_id, public_name)
+);
+-- model <-> account bindings: which accounts actually reported a model.
+-- 没有映射行的模型按「该平台所有账号都可用」处理（兼容旧库/手工插入的行）。
+CREATE TABLE IF NOT EXISTS model_accounts (
+  model_id   INTEGER NOT NULL,
+  account_id INTEGER NOT NULL,
+  created_at INTEGER DEFAULT (unixepoch()),
+  PRIMARY KEY (model_id, account_id)
+);
+CREATE TABLE IF NOT EXISTS apikeys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  key TEXT UNIQUE NOT NULL,
+  name TEXT,
+  enabled INTEGER DEFAULT 1,
+  allowed_models TEXT DEFAULT '*',  -- '*' or comma separated public model names
+  rpm_limit INTEGER DEFAULT 0,      -- 0 = unlimited
+  daily_limit INTEGER DEFAULT 0,    -- 0 = unlimited (credit units)
+  used_today REAL DEFAULT 0,
+  last_used_at INTEGER,
+  created_at INTEGER DEFAULT (unixepoch())
+);
+CREATE TABLE IF NOT EXISTS usage (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER DEFAULT (unixepoch()),
+  apikey_id INTEGER,
+  provider_id TEXT,
+  account_id INTEGER,
+  public_model TEXT,
+  upstream_model TEXT,
+  input_tokens INTEGER DEFAULT 0,
+  output_tokens INTEGER DEFAULT 0,
+  credits REAL DEFAULT 0,         -- estimated upstream credit consumption
+  multiplier REAL DEFAULT 1,
+  latency_ms INTEGER,
+  status INTEGER,                 -- HTTP status returned to client
+  error TEXT,
+  source TEXT                     -- openai | anthropic | mcp | test
+);
+CREATE TABLE IF NOT EXISTS mcp_servers (
+  id TEXT PRIMARY KEY,            -- mcp server name exposed to clients
+  enabled INTEGER DEFAULT 1,
+  transport TEXT DEFAULT 'stdio', -- stdio | http
+  command TEXT,                   -- for stdio
+  args TEXT DEFAULT '[]',
+  env TEXT DEFAULT '{}',
+  url TEXT,                       -- for http (sse/streamable)
+  headers TEXT DEFAULT '{}',
+  tool_filter TEXT DEFAULT '*',   -- '*' or comma separated tool names
+  created_at INTEGER DEFAULT (unixepoch())
+);
+CREATE TABLE IF NOT EXISTS virtual_models (
+  public_name TEXT PRIMARY KEY,   -- the name clients see (e.g. gpt-4o or glm-5.3)
+  enabled INTEGER DEFAULT 1,
+  targets TEXT NOT NULL,          -- JSON [{provider_id, public_name, priority, weight}] priority ascending = tried first
+  strategy TEXT DEFAULT 'priority', -- priority | weighted | least_conn（虚拟目标选择策略）
+  tags TEXT DEFAULT '',           -- free text tags for filtering (comma separated)
+  note TEXT,
+  created_at INTEGER DEFAULT (unixepoch())
+);
+CREATE TABLE IF NOT EXISTS checkin_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER DEFAULT (unixepoch()),
+  provider_id TEXT,
+  account_id INTEGER,
+  account_name TEXT,
+  ok INTEGER,                     -- 1 签到/已签成功，0 失败
+  message TEXT,
+  gained REAL                     -- 本次领取的积分（平台给多少记多少）
+);
+CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage(ts);
+CREATE INDEX IF NOT EXISTS idx_usage_model ON usage(public_model);
+CREATE INDEX IF NOT EXISTS idx_usage_apikey ON usage(apikey_id);
+CREATE INDEX IF NOT EXISTS idx_checkin_ts ON checkin_log(ts);
+CREATE INDEX IF NOT EXISTS idx_model_accounts_account ON model_accounts(account_id);
+`);
+// migration: virtual_models.tags added in ui-redesign; older DBs lack the column
+try {
+  db.prepare('SELECT tags FROM virtual_models LIMIT 1').get();
+} catch {
+  db.exec('ALTER TABLE virtual_models ADD COLUMN tags TEXT DEFAULT \'\'');
+}
+// migration: virtual_models.strategy added for weighted/least-conn load balancing
+try {
+  db.prepare('SELECT strategy FROM virtual_models LIMIT 1').get();
+} catch {
+  db.exec('ALTER TABLE virtual_models ADD COLUMN strategy TEXT DEFAULT \'priority\'');
+}
+// migration: accounts.alias (0.13.0) — 可读的 模型@账号别名；留空则按显示名自动生成
+try {
+  db.prepare('SELECT alias FROM accounts LIMIT 1').get();
+} catch {
+  db.exec('ALTER TABLE accounts ADD COLUMN alias TEXT');
+}
+
+const stmts = {
+  getSetting: db.prepare('SELECT value FROM settings WHERE key=?'),
+  setSetting: db.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value'),
+  allSettings: db.prepare('SELECT key,value FROM settings'),
+};
+
+function getSetting(key, fallback = undefined) {
+  const row = stmts.getSetting.get(key);
+  if (!row) return fallback;
+  try { return JSON.parse(row.value); } catch { return row.value; }
+}
+function setSetting(key, value) {
+  stmts.setSetting.run(key, JSON.stringify(value));
+}
+
+// migration: model_accounts introduced in 0.13.0 — existing models inherit every account
+// of their provider (same behavior as before), then per-account sync tightens it.
+try {
+  if (!getSetting('migration.model_accounts.v1', false)) {
+    const seeded = db.prepare(`INSERT OR IGNORE INTO model_accounts(model_id, account_id)
+      SELECT m.id, a.id FROM models m JOIN accounts a ON a.provider_id = m.provider_id`).run();
+    setSetting('migration.model_accounts.v1', true);
+    if (seeded.changes) console.log(`[modelwharf] model_accounts 回填 ${seeded.changes} 条（存量模型继承平台全部账号）`);
+  }
+} catch (e) {
+  console.error('[modelwharf] model_accounts 回填失败:', e.message);
+}
+
+module.exports = { db, getSetting, setSetting };
