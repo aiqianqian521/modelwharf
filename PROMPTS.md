@@ -111,6 +111,25 @@ iCubeAuthInfo://icube.cloudide，是 AES-128-CBC 加密串，网关内置解密�
 【注意】qwenwork 的 refreshToken 每次刷新轮换，必须由网关写回，不要手工缓存。
 ```
 
+### P1-f DuMate（千帆个人额度）
+
+```text
+【背景】DuMate 本地代理端口每次重启随机变化，网关里写死的 baseUrl 会失效；
+项目自带自动同步脚本（scripts/dumate-sync.ps1 + register-dumate-sync.ps1）。
+【做法】
+1. 后台「平台账号」添加 openai-compat 账号：
+   baseUrl=http://127.0.0.1:<当前端口>/api/qianfanproxy/v1  apiKey=nokey
+   （当前端口看 dumate-main-server.exe 进程参数 --port=，或直接让同步脚本跑一轮）
+2. 记下账号 ID，注册计划任务（S4U 静默模式，桌面不弹窗）：
+   powershell -ExecutionPolicy Bypass -File scripts\register-dumate-sync.ps1 -AccountId <ID>
+3. 验证：等 10 分钟或手动 Start-ScheduledTask DuMate-Modelwharf-Sync，
+   然后看 scripts 目录下 dwsync.log 最新一轮 ok=True 即通。
+【排错】log 里 upstream probe error → DuMate 客户端未就绪或额度异常，先人工打开客户端确认；
+gateway login failed → 后台密码不对，用 WH_ADMIN_PASSWORD 环境变量传强密码。
+【边界】S4U 会话里拉起的 DuMate 后台运行（无桌面窗口），日常 DuMate 常驻则无感知；
+不要手工缓存旧端口，一律交给同步脚本写回。
+```
+
 ---
 
 ## P2 · 客户端接入

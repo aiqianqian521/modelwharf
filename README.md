@@ -194,6 +194,40 @@ CredFields：`token`（必填）、`refreshToken`、`userId`、`xDeviceToken`、
 - 扫不到就到「平台账号 → 添加」查看该平台的 credFields 与内嵌说明
 - `qwenwork` 的 refreshToken **每次刷新都会轮换**，必须由网关写回数据库，不要手工缓存旧值
 
+### 4.6 DuMate（千帆个人额度，端口自动同步）
+
+DuMate 是百度千帆个人额度客户端，在本机起一个 OpenAI 兼容代理（`http://127.0.0.1:<随机端口>/api/qianfanproxy/v1`）。它有个特性：**本地代理端口每次重启都随机变化**，网关里写死的 baseUrl 很快失效。
+
+接入分两步：
+
+**第一步：网关建账号**（一次性）
+
+后台 →「平台账号」→ 添加 → `openai-compat` → 填当前端口：
+
+```
+baseUrl: http://127.0.0.1:<当前端口>/api/qianfanproxy/v1
+apiKey: nokey（占位，代理不校验）
+```
+
+**第二步：注册端口自动同步**（推荐，否则每次重启 DuMate 都要手改 baseUrl）
+
+```powershell
+# AccountId 换成第一步建好的账号 ID（后台「平台账号」页可见）
+powershell -ExecutionPolicy Bypass -File scripts\register-dumate-sync.ps1 -AccountId 3
+```
+
+脚本做了什么：
+
+- 每 10 分钟探测 `dumate-main-server.exe` 的当前端口，自动 PUT 回网关账号的 baseUrl
+- DuMate 没在跑时自动拉起客户端，等它就绪再同步
+- 以 **S4U 计划任务**（无论是否登录）运行 —— 普通交互任务每 10 分钟会在桌面弹一次控制台窗口，S4U 在非交互会话运行，**桌面零弹窗**；代价是 S4U 会话里拉起的 DuMate 后台运行（DuMate 常驻时无感知）
+- 日志与状态：`~/.dumate-sync/dwsync.log`、`state.json`（脚本目录下）
+
+> **注意**：同步脚本登录网关用的密码默认 `admin`，生产环境请先用 `WH_ADMIN_PASSWORD` 环境变量或 `-AdminPassword` 改强密码，与 3 节后台密码保持一致。
+> S4U 会话里无法读取登录用户的网络映射盘，脚本只访问本机回环地址，不受影响。
+
+脚本参数与手工排错见 `scripts/dumate-sync.ps1` 头部注释；完整实现（探测、拉起、探活、写回）也是那一个文件。
+
 ---
 
 ## 5. 同步模型 & 生成调用密钥
