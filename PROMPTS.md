@@ -245,3 +245,49 @@ env_key = "MODELWHARF_API_KEY"
 【WorkBuddy 扫不到】$wbEncrypted 加密信封，走 oauth/start 设备码流程，不要尝试解密。
 【模型列表缺模型】执行 POST /admin/api/refresh-models-all。
 ```
+
+---
+
+## P7 · 局域网集群（跨主机接入）
+
+> 前提：服务器已建好统一模型 `agent-main`。详见 README 第 12 章。
+
+### P7-a 服务端（在服务器上执行的 Agent）
+
+```text
+【任务】把本机 modelwharf 改为局域网可访问，并给每台客户端主机发独立 Key。
+【只做配置，不改项目代码】
+1. 查本机局域网 IP：ipconfig（IPv4 地址，例如 192.168.x.x）
+2. 防火墙放行（管理员）：New-NetFirewallRule -DisplayName "modelwharf 8317" `
+     -Direction Inbound -Protocol TCP -LocalPort 8317 -Action Allow -Profile Private
+3. 设置 WH_HOST=0.0.0.0 后重启网关；确认后台密码已改强（不要再是 admin）
+4. 为每台客户端主机发 Key：
+   POST /admin/api/apikeys
+   {"name":"<主机名>","allowed_models":"agent-main","rpm_limit":60,"daily_limit":0}
+5. 自检：本机 curl http://127.0.0.1:8317/v1/models（带 Key）应 200；
+   再用 http://<局域网IP>:8317/v1/models 验证监听已对外
+【交付】服务器 IP、每台主机的 Key（只显示后 4 位）、防火墙规则名、验证结果
+【禁止】不要把 data\wharf.db 共享出去；不要打印完整 token/Key；不要改 src 下代码
+```
+
+### P7-b 客户端（在其他主机上执行的 Agent）
+
+```text
+【任务】把本机 Agent 工具接到局域网网关，模型统一用 agent-main。
+【参数】服务器地址 http://<SERVER_IP>:8317 ，本机专用 Key：<KEY>
+【Claude Code】用户级 settings.json 的 env：
+  ANTHROPIC_BASE_URL=http://<SERVER_IP>:8317
+  ANTHROPIC_AUTH_TOKEN=<KEY>
+  ANTHROPIC_MODEL=agent-main
+【Codex CLI】config.toml：
+  base_url="http://<SERVER_IP>:8317/v1"
+  model="agent-main"
+  env_key 对应的环境变量值设为 <KEY>
+【WorkBuddy / Cursor】自定义模型地址 http://<SERVER_IP>:8317/v1，模型名 agent-main，勾选工具调用
+【验证】先 GET http://<SERVER_IP>:8317/v1/models（带 Key）应返回 200；
+再发最小对话请求确认可用
+【排错】连接 refused/超时 → 服务器防火墙或 WH_HOST 未改；
+401 → Key 错；403 admin only → 你访问的是后台，客户端不需要访问 /admin；
+no healthy account → 服务器侧账号池问题，联系服务器管理员
+【禁止】不要尝试访问服务器的 /admin；不要把 Key 写入项目仓库
+```

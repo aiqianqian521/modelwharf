@@ -84,7 +84,7 @@ schtasks /Delete /TN "modelwharf-gateway" /F
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `WH_PORT` | `8317` | 监听端口 |
-| `WH_HOST` | `0.0.0.0`（脚本内已改为 `127.0.0.1`） | 监听地址，**建议保持 127.0.0.1** |
+| `WH_HOST` | `0.0.0.0`（脚本内已改为 `127.0.0.1`） | 监听地址，**建议保持 127.0.0.1**；确需局域网集群接入见第 12 章 |
 | `WH_ADMIN_PASSWORD` | `admin` | 后台登录密码，**首次启动后务必修改** |
 | `WH_DATA_DIR` | `<包目录>\data` | 数据库与配置目录 |
 | `WH_LOG_DIR` | `<包目录>\logs` | 日志目录 |
@@ -391,3 +391,104 @@ Base：`http://127.0.0.1:8317`
 
 覆盖 `src\`、`package.json`、`package-lock.json`，保留 `data\`，然后重启。
 上游原始文档见 `README.upstream.md`、`AGENTS.upstream.md`。
+
+---
+
+## 12. 局域网集群部署（跨主机接入）
+
+目标：**一台服务器跑 modelwharf，局域网内其他主机直接用 `http://<服务器IP>:8317` 接入**，
+模型名统一填 `agent-main`，由网关接管整个集群的调度与故障转移。
+
+```
+其他主机（Claude Code / Codex / WorkBuddy / 脚本）
+      │  http://<服务器IP>:8317/v1   model=agent-main
+      ▼
+ modelwharf 服务器（WH_HOST=0.0.0.0）
+      ├─ /v1、/mcp  → 按 Key 鉴权，Key 锁定 agent-main
+      └─ /admin     → 建议仅本机可访问
+      ▼
+ trae / workbuddy / 千帆 / 官方 Key（凭证只存在服务器）
+```
+
+> 本章只是部署方案，**不需要修改项目代码、不需要重新打包或推送**；
+> 唯一的代码改动是 12.2 的可选安全补丁，不打也能跑。
+
+### 12.1 必改五项（纯配置）
+
+| 项 | 默认 | 改成 |
+|---|---|---|
+| 监听地址 | 默认仅本机 `127.0.0.1`（`start-gateway.ps1` 仅在未设时兜底） | 启动前设 `WH_HOST=0.0.0.0` |
+| Windows 防火墙 | 拦截外部入站 | 放行 8317（仅专用网络） |
+| 后台密码 | `admin` | 改强密码（面板或 `WH_ADMIN_PASSWORD`） |
+| 自启方式 | 登录时启动 | 改开机启动，免登录也能被调用 |
+| 调用 Key | 一把通用 | 每台主机一把，`allowed_models` 锁 `agent-main` |
+
+```powershell
+# 1) 防火墙（管理员 PowerShell）
+New-NetFirewallRule -DisplayName "modelwharf 8317" -Direction Inbound `
+  -Protocol TCP -LocalPort 8317 -Action Allow -Profile Private
+
+# 2) 局域网模式启动
+$env:WH_HOST="0.0.0.0"
+powershell -ExecutionPolicy Bypass -File "C:\mysite\modelwharf\start-gateway.ps1"
+
+# 3) 开机自启（免登录，管理员执行）
+schtasks /Create /TN "modelwharf-gateway" /SC ONSTART /RL HIGHEST /F `
+  /TR 'powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "$env:WH_HOST=''0.0.0.0''; & ''C:\mysite\modelwharf\start-gateway.ps1''"'
+
+# 4) 给某台主机发 Key（只允许 agent-main）
+POST /admin/api/apikeys
+{"name":"host-02-claude","allowed_models":"agent-main","rpm_limit":60,"daily_limit":0}
+```
+
+### 12.2 可选安全补丁：/admin 仅本机
+
+局域网模式下唯一建议的代码改动。在 `src/server.js` 里，
+`app.use('/admin/api', adminRoutes);`（当前第 83 行）**之前**插入：
+
+```js
+app.use('/admin', (req, res, next) => {
+  const ip = (req.ip || '').replace('::ffff:', '');
+  if (ip === '127.0.0.1' || ip === '::1') return next();
+  res.status(403).json({ error: 'admin is localhost only' });
+});
+```
+
+插在这一行之前，`/admin/api`（admin REST）与 `/admin` 静态面板会同时被拦住；
+插在之后则只拦住静态面板、REST 仍暴露，达不到效果。
+
+效果：局域网主机只能调 `/v1`、`/mcp`，后台只能在服务器本机打开。
+远程客户端的健康检查直接用 `GET /v1/models`（带 Key），返回 200 即链路正常。
+
+### 12.3 客户端配置
+
+| 客户端 | 配置 |
+|---|---|
+| Claude Code | `ANTHROPIC_BASE_URL=http://<服务器IP>:8317`、`ANTHROPIC_AUTH_TOKEN=<该机Key>`、`ANTHROPIC_MODEL=agent-main` |
+| Codex CLI | `base_url="http://<服务器IP>:8317/v1"`、`model="agent-main"`、环境变量放该机 Key |
+| WorkBuddy / Cursor | 自定义模型地址 `http://<服务器IP>:8317/v1`，模型名 `agent-main` |
+| MCP 客户端 | `http://<服务器IP>:8317/mcp`，Header 带该机 Key |
+
+调度策略（targets 顺序、新增平台）只在服务器面板改，全集群客户端自动生效。
+
+### 12.4 边界与风险
+
+- **接管的是请求，不是其他主机的客户端**。扫描本机凭证只读服务器自己的文件；
+  其他电脑上的 Trae/WorkBuddy 无法被远程读取，要入池只能拿到 token 后手动添加到服务器。
+- **凭证集中且明文**：所有账号 token 都在服务器的 `data/wharf.db`，
+  服务器需管好登录口令、磁盘权限，且不要共享 `data/`。
+- **HTTP 明文**：可信局域网内可接受；跨不可信网络必须套 HTTPS 反代（Caddy/Nginx），否则 Key 裸奔。
+- **单点**：服务器宕机则全集群不可用，可用 12.5 的双网关互备缓解。
+
+### 12.5 可选：跨主机双网关互备
+
+第二台机器也部署 modelwharf 后，把它当作一个上游接入主机：
+
+```
+provider_id = openai-compat
+baseUrl     = http://<第二台IP>:8317/v1
+apiKey      = <第二台的Key>
+```
+
+再把它的模型追加到 `agent-main` 的 targets 末尾（priority 最大），
+即可实现**跨主机兜底**：本机池子全失效时，自动落到另一台机器的额度。
