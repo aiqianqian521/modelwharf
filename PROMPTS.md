@@ -64,18 +64,59 @@ iCubeAuthInfo://icube.cloudide，是 AES-128-CBC 加密串，网关内置解密�
 ```text
 【目标】provider_id=workbuddy
 【已知】本地 workbuddy-desktop.info 是 {"$wbEncrypted":1,"envelope":"..."} 加密信封，
-不可解密；扫描器会将其永久排除，这是预期行为。
-【做法】
-1. POST /admin/api/providers/workbuddy/oauth/start → {state, authUrl}
-2. 把 authUrl 原样给用户，要求用 WorkBuddy 账号登录并确认授权；
-   不要自行打开、不要改写参数
-3. 用户确认后 POST /admin/api/providers/workbuddy/oauth/poll {"state":"<UID>"}，
-   pending=false 即成功（约每 3 秒轮询一次，最多 5 分钟）
-4. POST /admin/api/refresh-models-all
-5. 用该账号任一模型发最小请求验证
-【备选】用户从 copilot.tencent.com 抓包提供 Authorization: Bearer，
-连同可选 X-Device-Token，POST /admin/api/accounts 手动添加。
-【判读】code 14018 = 额度已用尽，不是配置错误；status=cooling 属正常降级。
+不可解密；扫描器会将其永久排除，这是预期行为，不要反复重扫。
+
+【做法 A：OAuth 设备码流程（推荐）】
+1. POST /admin/api/providers/workbuddy/oauth/start
+   → 返回 {"state":"<uuid>","authUrl":"https://copilot.tencent.com/login?platform=CLI&state=<uuid>"}
+2. 把 authUrl 原样给用户，要求：
+   - 用浏览器打开该链接
+   - 用 WorkBuddy 账号登录（手机号/微信/企业微信）
+   - 确认授权页面上的设备码
+   不要自行打开、不要改写 URL 参数
+3. 用户确认后，轮询检查状态：
+   POST /admin/api/providers/workbuddy/oauth/poll {"state":"<state值>"}
+   → 返回 {"pending":false, "account_id":<数字>, "name":"...", "identity":{...}}
+   每 3 秒轮询一次，最多 5 分钟；pending=false 且 account_id 存在即成功
+4. 确认账号已导入：
+   GET /admin/api/accounts → 找 provider_id=workbuddy 的记录
+   检查 status（应为 active 或 cooling）、模型数
+5. POST /admin/api/refresh-models-all → 同步模型列表
+6. 验证：用该账号任一模型发最小请求，返回 200 即成功
+
+【做法 B：手动抓包（OAuth 失败时）】
+1. 用户打开 https://copilot.tencent.com 并登录
+2. 打开浏览器开发者工具（F12）→ Network 标签
+3. 筛选任意一个请求，查看 Request Headers：
+   - Authorization: Bearer <token> ← 这是必填项
+   - X-Device-Token: <deviceToken> ← 可选，某些风控场景需要
+4. POST /admin/api/accounts
+   {
+     "provider_id":"workbuddy",
+     "name":"<自定义名>",
+     "credentials":{
+       "token":"<Bearer后面的值>",
+       "deviceToken":"<X-Device-Token值，可选>",
+       "userId":"<可选>",
+       "region":"cn"
+     },
+     "priority":100,
+     "max_concurrency":3
+   }
+5. POST /admin/api/refresh-models-all
+6. 最小请求验证
+
+【常见状态】
+- status=active：正常可用
+- status=cooling：临时冷却（429/5xx 触发），约 30 秒到 10 分钟后自动恢复
+- status=banned：code 14018 额度已用尽，不是配置错误，签到可少量续命
+- status=invalid：token 失效，需重新授权
+
+【验证清单】
+□ GET /admin/api/accounts 有 workbuddy 账号
+□ 该账号 `model_count` > 0（或 `refresh-models-all` 后 > 0）
+□ POST /v1/chat/completions 用 workbuddy 模型返回 200
+□ 若返回 14018，说明额度耗尽，不是接入失败
 ```
 
 ### P1-c 官方 API Key（最稳）

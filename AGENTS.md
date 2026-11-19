@@ -47,12 +47,32 @@ Responses API `/v1/responses`；Anthropic 兼容 `/v1/messages`；MCP `/mcp`。
 **workbuddy（腾讯 WorkBuddy / CodeBuddy）**
 - 本地文件是 `{"$wbEncrypted":1,"envelope":"..."}`，**不可解密，不要尝试破解**
 - 扫描器会把该项**永久加入排除名单**并返回原因，这是预期行为，不要反复重扫
-- 唯一正规路径：`POST /admin/api/providers/workbuddy/oauth/start` → 用户登录
-  `https://copilot.tencent.com/login?platform=CLI&state=<uuid>` → `oauth/poll`
-- 备选：用户在 `copilot.tencent.com` 网页登录后，从请求头取 `Authorization: Bearer ...`
-  与可选 `X-Device-Token`，手动 `POST /admin/api/accounts`
-- 字段：`token`(必填)、`refreshToken`、`userId`、`xDeviceToken`、`region`
-- `code 14018` = 额度用尽，不是配置错误
+
+**做法 A：OAuth 设备码流程（推荐）**
+1. `POST /admin/api/providers/workbuddy/oauth/start`
+   → 返回 `{"state":"<uuid>","authUrl":"https://copilot.tencent.com/login?platform=CLI&state=<uuid>"}`
+2. 把 authUrl 原样给用户，要求用浏览器打开并登录确认
+3. 轮询：`POST /admin/api/providers/workbuddy/oauth/poll {"state":"<state值>"}`
+   → 返回 `{"pending":false, "account_id":<数字>, "name":"...", "identity":{...}}`
+   每 3 秒轮询一次，最多 5 分钟；pending=false 且 account_id 存在即成功
+4. 确认账号已导入：`GET /admin/api/accounts` 找 provider_id=workbuddy 的记录
+5. `POST /admin/api/refresh-models-all` → 同步模型列表
+6. 最小请求验证
+
+**做法 B：手动抓包（OAuth 失败时）**
+1. 用户打开 https://copilot.tencent.com 并登录
+2. F12 → Network → 查看任意请求的 Request Headers
+3. 复制 `Authorization: Bearer <token>` 中的 token 值（必填）
+   和 `X-Device-Token`（可选，风控场景需要）
+4. `POST /admin/api/accounts {"provider_id":"workbuddy","credentials":{"token":"...","deviceToken":"...","region":"cn"}}`
+5. `POST /admin/api/refresh-models-all`
+
+**字段**：`token`(必填)、`refreshToken`、`userId`、`deviceToken`、`region`
+**状态**：
+- `active`：正常可用
+- `cooling`：临时冷却（429/5xx 触发），30 秒到 10 分钟后自动恢复
+- `banned`：code 14018 额度用尽，不是配置错误
+- `invalid`：token 失效，需重新授权
 
 **qoder / qodercn / qwen / qwenwork**
 - 先扫描；再查 providers 返回的 credFields 与 docs
@@ -66,6 +86,15 @@ Responses API `/v1/responses`；Anthropic 兼容 `/v1/messages`；MCP `/mcp`。
 - 内置 `doubao` 指的是火山方舟官方 API Key，**不是豆包客户端登录态**
 - 想用客户端额度：需额外部署 doubao2api（默认 :9090），再以 `openai-compat` 接入
 - 必须向用户说明走的是哪条路线、额度归属谁
+
+**DuMate（千帆个人额度）**
+- 本地代理端口每次重启随机变化，网关里写死的 baseUrl 会失效
+- 接入方式：
+  1. 后台添加 `openai-compat` 账号：`baseUrl=http://127.0.0.1:<当前端口>/api/qianfanproxy/v1`、`apiKey=nokey`
+  2. 注册端口同步脚本：`powershell -ExecutionPolicy Bypass -File scripts\register-dumate-sync.ps1 -AccountId <ID>`
+  3. 验证：等 10 分钟或手动 `Start-ScheduledTask DuMate-Modelwharf-Sync`，看 `dwsync.log` 最新一轮 `ok=True`
+- 排错：`upstream probe error` → DuMate 客户端未就绪；`gateway login failed` → 后台密码不对
+- 边界：S4U 会话里拉起的 DuMate 后台运行，不要手工缓存旧端口
 
 ---
 
@@ -155,12 +184,38 @@ target 字段固定为 `{provider_id, public_name, priority, weight}`：
 
 ```text
 【目标】provider_id = workbuddy
-【已知】本地 workbuddy-desktop.info 是 $wbEncrypted 加密信封，不可解密。
-【做法】POST /admin/api/providers/workbuddy/oauth/start → 把 authUrl 给我 →
-我登录后你 POST .../oauth/poll {"state":"<uuid>"} 直到 pending=false →
-refresh-models-all → 最小请求验证。
-【备选】我在 copilot.tencent.com 抓 Authorization: Bearer 给你，你 POST /admin/api/accounts。
-【注意】code 14018 = 额度用尽，不是配置问题。
+【已知】本地 workbuddy-desktop.info 是 $wbEncrypted 加密信封，不可解密，扫描器会永久排除。
+
+【做法 A：OAuth 设备码流程】
+1. POST /admin/api/providers/workbuddy/oauth/start
+   → 返回 {"state":"<uuid>","authUrl":"https://copilot.tencent.com/login?platform=CLI&state=<uuid>"}
+2. 把 authUrl 原样给我，我用浏览器打开并登录确认
+3. 我确认后，你轮询：
+   POST /admin/api/providers/workbuddy/oauth/poll {"state":"<state值>"}
+   每 3 秒一次，最多 5 分钟；pending=false 且 account_id 存在即成功
+4. GET /admin/api/accounts 确认 workbuddy 账号已导入
+5. POST /admin/api/refresh-models-all
+6. 最小请求验证
+
+【做法 B：手动抓包】
+1. 我打开 https://copilot.tencent.com 并登录
+2. F12 → Network → 查看任意请求的 Request Headers
+3. 我提供 Authorization: Bearer 后面的 token 值（必填）
+   和 X-Device-Token（可选）
+4. 你 POST /admin/api/accounts {"provider_id":"workbuddy","credentials":{"token":"...","deviceToken":"...","region":"cn"}}
+5. POST /admin/api/refresh-models-all
+
+【状态判读】
+- active：正常可用
+- cooling：临时冷却，30 秒到 10 分钟后自动恢复
+- banned：code 14018 额度用尽，不是配置问题
+- invalid：token 失效，需重新授权
+
+【验证清单】
+□ GET /admin/api/accounts 有 workbuddy 账号
+□ 该账号 `model_count` > 0
+□ POST /v1/chat/completions 用 workbuddy 模型返回 200
+□ 若返回 14018，说明额度耗尽，不是接入失败
 ```
 
 ### 6.3 云端 Agent（不能访问本机文件 / 127.0.0.1）
@@ -180,3 +235,46 @@ refresh-models-all → 最小请求验证。
 - [ ] `refresh-models-all` 执行后能看到该账号的模型
 - [ ] `POST /v1/chat/completions` 返回 200 且有内容
 - [ ] 已生成独立 `wh-` Key 并交付给用户（只显示后 4 位）
+
+---
+
+## 8. 局域网集群约束（跨主机接入）
+
+**前提**：服务器已建好统一模型 `agent-main`。
+
+### 8.1 服务端配置（在服务器上执行）
+
+```
+1. 查本机局域网 IP：ipconfig（IPv4 地址）
+2. 防火墙放行（管理员）：
+   New-NetFirewallRule -DisplayName "modelwharf 8317" -Direction Inbound `
+     -Protocol TCP -LocalPort 8317 -Action Allow -Profile Private
+3. 设置 WH_HOST=0.0.0.0 后重启网关
+4. 确认后台密码已改强（不要再是 admin）
+5. 为每台客户端主机发 Key：
+   POST /admin/api/apikeys
+   {"name":"<主机名>","allowed_models":"agent-main","rpm_limit":60,"daily_limit":0}
+```
+
+### 8.2 客户端配置（在其他主机上执行）
+
+| 客户端 | 配置 |
+|---|---|
+| Claude Code | `ANTHROPIC_BASE_URL=http://<SERVER_IP>:8317`、`ANTHROPIC_AUTH_TOKEN=<KEY>`、`ANTHROPIC_MODEL=agent-main` |
+| Codex CLI | `base_url="http://<SERVER_IP>:8317/v1"`、`model="agent-main"`、环境变量放该机 Key |
+| WorkBuddy / Cursor | 自定义模型地址 `http://<SERVER_IP>:8317/v1`，模型名 `agent-main`，勾选工具调用 |
+| MCP 客户端 | `http://<SERVER_IP>:8317/mcp`，Header 带该机 Key |
+
+### 8.3 边界与风险
+
+- **凭证集中**：所有账号 token 都在服务器的 `data/wharf.db`，不要共享 `data/`
+- **HTTP 明文**：可信局域网内可接受；跨不可信网络必须套 HTTPS 反代
+- **单点**：服务器宕机则全集群不可用
+- **扫描限制**：只能扫描服务器本机的客户端，不能远程扫描其他主机的 Trae/WorkBuddy
+
+### 8.4 硬性约束
+
+- 不要把 `data/wharf.db` 共享出去
+- 不要打印完整 token/Key
+- 不要改 `src` 下代码（除非明确要求）
+- 不要尝试访问服务器的 `/admin`（客户端不需要）

@@ -146,27 +146,46 @@ Invoke-RestMethod http://127.0.0.1:8317/admin/api/refresh-models-all -Method Pos
 
 1. 后台 →「平台账号」→ 添加 → WorkBuddy → 「网页授权」，或调用：
    ```powershell
-   POST /admin/api/providers/workbuddy/oauth/start   → {state, authUrl}
+   POST /admin/api/providers/workbuddy/oauth/start
+   → 返回 {"state":"<uuid>","authUrl":"https://copilot.tencent.com/login?platform=CLI&state=<uuid>"}
    ```
-2. 打开返回的 `authUrl`（形如 `https://copilot.tencent.com/login?platform=CLI&state=<uuid>`），
-   用 **WorkBuddy 账号**登录并确认授权
-3. 轮询直到 `pending=false`：
+2. 用浏览器打开返回的 `authUrl`，用 **WorkBuddy 账号**登录并确认授权
+3. 轮询检查状态（每 3 秒一次，最多 5 分钟）：
    ```powershell
-   POST /admin/api/providers/workbuddy/oauth/poll   body {"state":"<uuid>"}
+   POST /admin/api/providers/workbuddy/oauth/poll {"state":"<state值>"}
+   → 返回 {"pending":false, "account_id":<数字>, "name":"...", "identity":{...}}
    ```
+   `pending=false` 且 `account_id` 存在即成功
+4. 确认账号已导入：`GET /admin/api/accounts` 找 `provider_id=workbuddy` 的记录
+5. 同步模型：`POST /admin/api/refresh-models-all`
+6. 验证：用该账号任一模型发最小请求，返回 200 即成功
 
 **路线 B：抓包（拿不到 refreshToken，约 1 个月重抓一次）**
 
 1. 浏览器打开 `https://copilot.tencent.com` 并登录
-2. F12 → Network → 任一接口请求 → 复制请求头 `Authorization: Bearer xxx`
+2. F12 → Network → 任一接口请求 → 复制请求头：
+   - `Authorization: Bearer xxx`（必填）
+   - `X-Device-Token`（可选，某些风控场景需要）
 3. 后台手动添加账号，粘贴 token；有 `X-Device-Token` 一并填
+4. 同步模型并验证
 
-CredFields：`token`（必填）、`refreshToken`、`userId`、`xDeviceToken`、`region`（默认 `cn`）。
+CredFields：`token`（必填）、`refreshToken`、`userId`、`deviceToken`、`region`（默认 `cn`）。
 
-**常见状态**
+**账号状态判读**
 
-- `cooling` + `code 14018 额度已用尽` → 免费积分耗尽，等签到/购买加量包
-- 账号名显示 `wb-%0a` 只是身份接口返回了 URL 编码换行，功能不受影响
+| 状态 | 含义 | 处理 |
+|---|---|---|
+| `active` | 正常可用 | 无需处理 |
+| `cooling` | 临时冷却（429/5xx 触发） | 30 秒到 10 分钟后自动恢复 |
+| `banned` | `code 14018` 额度已用尽 | 签到可少量续命，建议接官方 API 兜底 |
+| `invalid` | token 失效 | 重新授权或抓包 |
+
+**验证清单**
+
+- [ ] `GET /admin/api/accounts` 有 `workbuddy` 账号
+- [ ] 该账号 `model_count` > 0（或 `refresh-models-all` 后 > 0）
+- [ ] `POST /v1/chat/completions` 用 workbuddy 模型返回 200
+- [ ] 若返回 `14018`，说明额度耗尽，不是接入失败
 
 ### 4.4 官方 API Key（最稳，适合长期跑 Agent）
 
