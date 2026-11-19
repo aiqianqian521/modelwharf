@@ -49,35 +49,44 @@ node -v
 
 ## 2. 启动 / 停止 / 开机自启
 
-### 手动启动
-
-双击或在 PowerShell 执行：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File "C:\mysite\modelwharf\start-gateway.ps1"
-```
-
-脚本会：检查端口占用 → 设置 `WH_HOST=127.0.0.1`（仅本机可访问）→ 前台运行并打印日志。
-
-### 后台启动（不占窗口）
-
-```powershell
-Start-Process powershell -WindowStyle Hidden -ArgumentList "-ExecutionPolicy Bypass -File C:\mysite\modelwharf\start-gateway.ps1"
-```
-
-包内也保留了上游的 `start-hidden.bat` / `stop.bat`。
-
-### 开机自启（推荐）
+### 推荐：后台默认自启 + 崩溃自愈（一次注册，长期免管）
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File "C:\mysite\modelwharf\install-autostart.ps1"
 ```
 
-会创建一个名为 `modelwharf-gateway` 的登录时计划任务。卸载：
+这一条命令完成全部配置，注册后**不需要任何 Agent 接管**：
+
+- 计划任务 `modelwharf-gateway` 用 **S4U 非交互**运行，桌面零弹窗；
+- **登录时立即巡检一次**，之后**每 2 分钟**巡检；网关挂了会自动以隐藏窗口拉起；
+- 巡检由 `scripts\gateway-watchdog.ps1` 执行，只有「端口 LISTENING 且 `/health` 返回 200」才算活着；
+- 守护日志：`logs\gateway-watchdog.log`；网关运行日志：`logs\wharf.log`；
+- 间隔可用环境变量 `WH_WATCH_INTERVAL` 覆盖（分钟，默认 2）。
+
+卸载自启（网关也会随之停止自动拉起）：
 
 ```powershell
 schtasks /Delete /TN "modelwharf-gateway" /F
 ```
+
+> 迁移到新环境：装好 Node 与依赖后，只需在新路径执行上面的 `install-autostart.ps1`。
+> 脚本全部用 `$PSScriptRoot` 定位，不硬编码 `C:\mysite\modelwharf`，换盘符/换目录照样工作。
+
+### 手动前台启动（调试用）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "C:\mysite\modelwharf\start-gateway.ps1"
+```
+
+检查端口占用 → 设置 `WH_HOST=127.0.0.1`（仅本机可访问）→ 前台运行并打印日志。关窗口即停，不适合日常使用。
+
+### 临时后台拉起一次（不注册自启）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "C:\mysite\modelwharf\scripts\gateway-watchdog.ps1"
+```
+
+包内也保留了上游的 `start-hidden.bat` / `stop.bat`。
 
 ### 常用环境变量
 
@@ -90,6 +99,21 @@ schtasks /Delete /TN "modelwharf-gateway" /F
 | `WH_LOG_DIR` | `<包目录>\logs` | 日志目录 |
 | `WH_REQUEST_TIMEOUT_MS` | `300000` | 上游请求超时（5 分钟） |
 | `WH_API_KEYS` | 空 | 预置调用密钥（逗号分隔），留空则用后台生成的 Key |
+
+### 数据存在哪 / 换机怎么带数据（必读）
+
+**账号、模型、API Key 全部存在 `<包目录>\data\wharf.db`**（SQLite，`wharf.db-wal` / `wharf.db-shm` 是它的预写日志，三者要在一起）。数据库路径由服务端按 `__dirname` 解析，**与启动时的工作目录无关**，只认「这个包目录下的 data」。
+
+- **正常运行目录只有一个**：本次部署以 `C:\mysite\modelwharf` 为准。自启任务、守护脚本、文档都指向这里。若机器上还有其他 modelwharf 副本（例如旧 temp 目录），那些库与本实例**互不相通**，不要混用。
+- **看到「一个账号都没有」时先查库，不要急着重新接入**：
+  ```powershell
+  python -c "import sqlite3;c=sqlite3.connect(r'C:\mysite\modelwharf\data\wharf.db');print([c.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0] for t in ('accounts','models','apikeys')])"
+  ```
+  三个数应分别是账号数 / 模型数 / Key 数。若为 0，多半是**启动错了目录**（node 在别的 data 下新建了空库），去查计划任务 `modelwharf-gateway` 的动作路径，而不是数据丢了。
+- **换机 / 迁移**：正确做法是**连 `data\` 目录一起复制**，再在新路径执行 `install-autostart.ps1`。只复制脚本不复制 `data\`，等于接入一个空网关。
+- **备份**：直接复制整个 `data\` 目录即可；在线复制时把 `wharf.db` + `-wal` + `-shm` 三个文件一起拷，或用 `sqlite3` 的 `.backup` / Python `sqlite3.Connection.backup()` 生成一致性快照。
+
+> 历史坑（2026-11-19）：曾把自启装到新目录、而数据还在旧 temp 目录，导致网关读空库、误以为数据丢失。数据实际完好，已迁回本目录；排查命令与迁移方式都记在这里，避免重演。
 
 ---
 
@@ -237,9 +261,10 @@ powershell -ExecutionPolicy Bypass -File scripts\register-dumate-sync.ps1 -Accou
 
 脚本做了什么：
 
-- 每 10 分钟探测 `dumate-main-server.exe` 的当前端口，自动 PUT 回网关账号的 baseUrl
+- **每小时整点（:00）**探测 `dumate-main-server.exe` 的当前端口，自动 PUT 回网关账号的 baseUrl
 - DuMate 没在跑时自动拉起客户端，等它就绪再同步
-- 以 **S4U 计划任务**（无论是否登录）运行 —— 普通交互任务每 10 分钟会在桌面弹一次控制台窗口，S4U 在非交互会话运行，**桌面零弹窗**；代价是 S4U 会话里拉起的 DuMate 后台运行（DuMate 常驻时无感知）
+- 以 **S4U 计划任务**（无论是否登录）运行 —— 普通交互任务每次触发都会在桌面弹一次控制台窗口，S4U 在非交互会话运行，**桌面零弹窗**；代价是 S4U 会话里拉起的 DuMate 后台运行（DuMate 常驻时无感知）
+- 需要更高频时改注册参数：`-RunAtHour:$false -IntervalMinutes 10`（默认整点，间隔 1 小时）
 - 日志与状态：`~/.dumate-sync/dwsync.log`、`state.json`（脚本目录下）
 
 > **注意**：同步脚本登录网关用的密码默认 `admin`，生产环境请先用 `WH_ADMIN_PASSWORD` 环境变量或 `-AdminPassword` 改强密码，与 3 节后台密码保持一致。
@@ -473,7 +498,7 @@ Base：`http://127.0.0.1:8317`
 | 监听地址 | 默认仅本机 `127.0.0.1`（`start-gateway.ps1` 仅在未设时兜底） | 启动前设 `WH_HOST=0.0.0.0` |
 | Windows 防火墙 | 拦截外部入站 | 放行 8317（仅专用网络） |
 | 后台密码 | `admin` | 改强密码（面板或 `WH_ADMIN_PASSWORD`） |
-| 自启方式 | 登录时启动 | 改开机启动，免登录也能被调用 |
+| 自启方式 | 后台自启（S4U，登录时 + 每 2 分钟巡检） | 已满足免登录运行；如要纯 `0.0.0.0` 监听见下方说明 |
 | 调用 Key | 一把通用 | 每台主机一把，`allowed_models` 锁 `agent-main` |
 
 ```powershell
@@ -481,13 +506,11 @@ Base：`http://127.0.0.1:8317`
 New-NetFirewallRule -DisplayName "modelwharf 8317" -Direction Inbound `
   -Protocol TCP -LocalPort 8317 -Action Allow -Profile Private
 
-# 2) 局域网模式启动
-$env:WH_HOST="0.0.0.0"
-powershell -ExecutionPolicy Bypass -File "C:\mysite\modelwharf\start-gateway.ps1"
-
-# 3) 开机自启（免登录，管理员执行）
-schtasks /Create /TN "modelwharf-gateway" /SC ONSTART /RL HIGHEST /F `
-  /TR 'powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "$env:WH_HOST=''0.0.0.0''; & ''C:\mysite\modelwharf\start-gateway.ps1''"'
+# 2) 后台自启（本机默认，一次注册长期有效；S4U 登录前后都能跑）
+powershell -ExecutionPolicy Bypass -File "C:\mysite\modelwharf\install-autostart.ps1"
+#    默认 127.0.0.1。若要局域网监听 0.0.0.0，传参：
+#    .\install-autostart.ps1 -ListenHost 0.0.0.0
+#    参数写入 data\gateway-runtime.json，守护脚本读取后透传给 node。
 
 # 4) 给某台主机发 Key（只允许 agent-main）
 POST /admin/api/apikeys

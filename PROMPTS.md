@@ -44,6 +44,28 @@
 
 ---
 
+## P0-b · 网关后台自启部署（换机/初始化时先做）
+
+```text
+【任务】把 modelwharf 网关设为后台默认自启，不依赖任何 Agent 会话拉起。
+【执行】
+1. 确认 node 可用（node -v），项目目录下 npm install 已完成
+2. powershell -ExecutionPolicy Bypass -File "<项目目录>\install-autostart.ps1"
+   - 默认 127.0.0.1:8317；局域网传 -ListenHost 0.0.0.0
+   - 注册 S4U 计划任务 modelwharf-gateway：登录时 + 每 2 分钟巡检
+   - 巡检脚本 scripts\gateway-watchdog.ps1：端口 LISTEN 且 /health 200 才算活，否则隐藏窗口拉起
+3. 验证：
+   - Get-ScheduledTask -TaskName modelwharf-gateway → State=Ready，LogonType=S4U
+   - GET http://127.0.0.1:8317/health → 200
+   - 停止网关进程后等一个巡检周期（或手动跑一次 watchdog），应自动恢复 200
+   - 查看 logs\gateway-watchdog.log 有 STARTED / healthy 记录
+【交付】任务名、登录类型、巡检间隔、自愈验证结果
+【禁止】不要用 Agent 会话 Start-Process 常驻网关；不要打印完整 token/Key
+【取消】schtasks /Delete /TN modelwharf-gateway /F
+```
+
+---
+
 ## P1 · 平台专项
 
 ### P1-a Trae
@@ -157,18 +179,29 @@ iCubeAuthInfo://icube.cloudide，是 AES-128-CBC 加密串，网关内置解密�
 ```text
 【背景】DuMate 本地代理端口每次重启随机变化，网关里写死的 baseUrl 会失效；
 项目自带自动同步脚本（scripts/dumate-sync.ps1 + register-dumate-sync.ps1）。
+【前置】先看库里是否已有 openai-compat 账号（status 可能是 cooling，属正常冷却，别急着删）：
+  python -c "import sqlite3;c=sqlite3.connect('data/wharf.db');print(c.execute('SELECT id,name,status FROM accounts').fetchall())"
+  已存在且只因端口变了导致不通 → 直接跳到「做法 3」跑一轮同步即可，不要删账号重建。
 【做法】
-1. 后台「平台账号」添加 openai-compat 账号：
+1. 若确实没有账号，后台「平台账号」添加 openai-compat：
    baseUrl=http://127.0.0.1:<当前端口>/api/qianfanproxy/v1  apiKey=nokey
-   （当前端口看 dumate-main-server.exe 进程参数 --port=，或直接让同步脚本跑一轮）
-2. 记下账号 ID，注册计划任务（S4U 静默模式，桌面不弹窗）：
+   （当前端口：Get-CimInstance Win32_Process -Filter "Name='dumate-main-server.exe'" 看 --port=）
+2. 记下账号 ID，注册计划任务（S4U 静默模式，桌面不弹窗，默认每小时整点 :00 运行）：
    powershell -ExecutionPolicy Bypass -File scripts\register-dumate-sync.ps1 -AccountId <ID>
-3. 验证：等 10 分钟或手动 Start-ScheduledTask DuMate-Modelwharf-Sync，
-   然后看 scripts 目录下 dwsync.log 最新一轮 ok=True 即通。
-【排错】log 里 upstream probe error → DuMate 客户端未就绪或额度异常，先人工打开客户端确认；
-gateway login failed → 后台密码不对，用 WH_ADMIN_PASSWORD 环境变量传强密码。
+   （要更高频：-RunAtHour:$false -IntervalMinutes 10）
+3. 让同步脚本写回当前端口（不用等到下个整点）：
+   Start-ScheduledTask -TaskName 'DuMate-Modelwharf-Sync'
+   等约 1 分钟，看 ~/.dumate-sync/dwsync.log 最新一轮出现
+   "account #<ID> baseUrl -> ... ok=True" 且 "post-sync upstream_ok=True" 即通。
+4. 复核库里 baseUrl 端口 == 客户端当前 --port。
+【排错】
+- upstream probe error → DuMate 客户端未就绪或额度异常，先人工打开客户端确认；
+- gateway update failed (404) → 写回那一刻网关没在跑（端口 8317 无 LISTEN），
+  先确认 modelwharf-gateway 自启任务正常、/health=200，再 Start-ScheduledTask 重跑一轮；
+  status=cooling 是临时冷却，会自动恢复，不是配置错误；
+- gateway login failed → 后台密码不对，用 WH_ADMIN_PASSWORD 或 -AdminPassword 传强密码。
 【边界】S4U 会话里拉起的 DuMate 后台运行（无桌面窗口），日常 DuMate 常驻则无感知；
-不要手工缓存旧端口，一律交给同步脚本写回。
+不要手工缓存旧端口，一律交给同步脚本写回；不要因 cooling 就删账号重建（会丢模型/key）。
 ```
 
 ---

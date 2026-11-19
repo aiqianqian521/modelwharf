@@ -1,4 +1,4 @@
-param(
+﻿param(
     # modelwharf 网关地址
     [string]$Gateway = 'http://localhost:8317',
     # 网关里对应 DuMate 的账号 ID（先在后台「平台账号」里建好 openai-compat 账号）

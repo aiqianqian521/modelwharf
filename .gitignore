@@ -21,3 +21,7 @@ inspect.cjs
 
 # ZCode session working files (plans/tmp scripts/keys)
 .zcode/
+
+# Editor backups & runtime state
+*.bak
+scripts/state.json

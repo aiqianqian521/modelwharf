@@ -13,8 +13,15 @@
 | 管理后台 | `http://127.0.0.1:8317/admin`（默认密码 `admin`，可能已被改） |
 | 管理 API 鉴权 | `POST /admin/api/login {"password":"..."}` → `{token}`，之后 `Authorization: Bearer <token>` |
 | 调用 API 鉴权 | `Authorization: Bearer <网关Key，wh- 开头>` |
-| 数据库 | `data/wharf.db`（SQLite，**明文凭证**） |
+| 数据库 | `data/wharf.db`（SQLite，**明文凭证**）；连同 `-wal`/`-shm` 是一个整体 |
+| 数据目录 | `<包目录>\data`，路径由 `__dirname` 解析，与启动 cwd 无关 |
+| 唯一运行目录 | 以本包目录（如 `C:\mysite\modelwharf`）为准；其他副本的库互不相通 |
 | 版本 | 0.13.1 |
+
+**看到账号为 0 时先查库再动手**（不要在空库上重新接入，那是误判）：
+1. `python -c "import sqlite3;c=sqlite3.connect('data/wharf.db');print([c.execute('SELECT COUNT(*) FROM '+t).fetchone()[0] for t in ('accounts','models','apikeys')])"`
+2. 若为 0，检查自启任务 `modelwharf-gateway` 的动作路径是否指向本包 —— 多半是启动错目录导致 node 新建了空库，数据其实在别的 `data` 里。
+3. 换机/迁移必须连 `data\` 一起复制，再执行 `install-autostart.ps1`，只带脚本不带数据 = 空网关。
 
 接口能力：OpenAI 兼容 `/v1/chat/completions`、`/v1/models`、`/v1/completions`、`/v1/embeddings`；
 Responses API `/v1/responses`；Anthropic 兼容 `/v1/messages`；MCP `/mcp`。
@@ -92,9 +99,32 @@ Responses API `/v1/responses`；Anthropic 兼容 `/v1/messages`；MCP `/mcp`。
 - 接入方式：
   1. 后台添加 `openai-compat` 账号：`baseUrl=http://127.0.0.1:<当前端口>/api/qianfanproxy/v1`、`apiKey=nokey`
   2. 注册端口同步脚本：`powershell -ExecutionPolicy Bypass -File scripts\register-dumate-sync.ps1 -AccountId <ID>`
-  3. 验证：等 10 分钟或手动 `Start-ScheduledTask DuMate-Modelwharf-Sync`，看 `dwsync.log` 最新一轮 `ok=True`
+  3. 验证：任务默认每小时整点（:00）运行；立刻验证用 `Start-ScheduledTask DuMate-Modelwharf-Sync`，看 `dwsync.log` 最新一轮 `ok=True`
 - 排错：`upstream probe error` → DuMate 客户端未就绪；`gateway login failed` → 后台密码不对
 - 边界：S4U 会话里拉起的 DuMate 后台运行，不要手工缓存旧端口
+
+---
+
+## 1.5 网关自身的后台自启（不靠 Agent 拉起）
+
+网关应作为系统服务常驻，Agent 只调用它、不负责让它活着。初始化/迁移到新环境时执行一次：
+
+```
+powershell -ExecutionPolicy Bypass -File "<项目目录>\install-autostart.ps1"
+```
+
+它注册 S4U 计划任务 `modelwharf-gateway`（非交互、桌面零弹窗）：登录时巡检一次 + 每 2 分钟巡检，
+由 `scripts\gateway-watchdog.ps1` 判断「端口 LISTEN + /health 200」，不健康就以隐藏窗口拉起 `node src/server.js`。
+可用 `WH_WATCH_INTERVAL`（分钟）调巡检间隔；局域网监听用 `-Host 0.0.0.0 -Port 8317`，
+局域网监听传 `-ListenHost 0.0.0.0`，参数写入 `data\gateway-runtime.json` 供 S4U 会话读取。
+
+- 查状态：`Get-ScheduledTask -TaskName modelwharf-gateway`
+- 手动拉起一次：`powershell -ExecutionPolicy Bypass -File "<项目目录>\scripts\gateway-watchdog.ps1"`
+- 守护日志：`logs\gateway-watchdog.log`；网关日志：`logs\wharf.log`
+- 取消自启：`schtasks /Delete /TN modelwharf-gateway /F`
+- 判定「网关挂了」：8317 无 LISTENING 且 `GET /health` 不通；此时先跑一次 watchdog，再查日志。
+
+不要用 Agent 会话去 `Start-Process` 常驻网关（会话结束进程可能被回收），一律交给计划任务。
 
 ---
 
